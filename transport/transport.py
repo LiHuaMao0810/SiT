@@ -156,6 +156,34 @@ class Transport:
                 terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
                 
         return terms
+
+    def per_sample_loss(
+        self,
+        model,
+        x1,
+        model_kwargs=None,
+        t=None,
+        noise=None,
+    ):
+        """Compute per-sample CFM loss (shape: [B])."""
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        if t is None:
+            t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
+            t = th.rand((x1.shape[0],), device=x1.device, dtype=x1.dtype) * (t1 - t0) + t0
+        else:
+            t = t.to(device=x1.device, dtype=x1.dtype)
+
+        if noise is None:
+            x0 = th.randn_like(x1)
+        else:
+            x0 = noise.to(device=x1.device, dtype=x1.dtype)
+
+        _, xt, ut = self.path_sampler.plan(t, x0, x1)
+        model_output = model(xt, t, **model_kwargs)
+        assert model_output.shape == ut.shape, "Model output shape must match target velocity shape."
+        return ((model_output - ut) ** 2).mean(dim=tuple(range(1, model_output.ndim)))
     
 
     def get_drift(
