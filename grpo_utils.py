@@ -16,7 +16,7 @@ def _slice_model_kwargs(model_kwargs, start, end):
     return sliced
 
 
-def compute_elbo_ratio(student, x1_exp, model_kwargs, transport, tau_mc, eps_mc, ell_T_cached):
+def compute_elbo_ratio(student, x1_exp, model_kwargs, transport, tau_mc, eps_mc, ell_T_cached, chunk_size=None):
     """
     Compute ELBO ratio with cached teacher losses.
 
@@ -28,7 +28,6 @@ def compute_elbo_ratio(student, x1_exp, model_kwargs, transport, tau_mc, eps_mc,
     batch = x1_exp.shape[0]
     n_mc = tau_mc.shape[1]
     ell_eta_mean = torch.zeros(batch, device=x1_exp.device, dtype=x1_exp.dtype)
-    chunk_size = model_kwargs.get("_chunk_size", None)
     if chunk_size is None or chunk_size <= 0:
         chunk_size = batch
     for j in range(n_mc):

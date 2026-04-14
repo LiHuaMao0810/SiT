@@ -473,21 +473,27 @@ ELBO-GRPO 1步蒸馏训练脚本。
 
 ### 6. `train_sde_grpo.py`（新建，SDE-GRPO baseline）
 
-与 `train_elbo_grpo.py` **结构完全相同**，Phase 1/2 分离、K 次更新、超参全部一致。
+与 `train_elbo_grpo.py` **结构类似**，但 baseline 严格对齐原始 Flow-GRPO：
 
-**唯一差异**：Phase 2 的 ratio 计算方式：
+- old policy 不是 teacher，而是 `policy_old = deepcopy(student)` 的快照
+- Phase 1 探索由 `policy_old` 进行 SDE rollout，并累计 `log_p_old`
+- Phase 2 用当前 `student` 在**同一条噪声轨迹**上重算 `log_p_new`
+- ratio: `log_r = log_p_new - log_p_old`
+- 每隔 `old_policy_update_freq` 步更新一次 `policy_old`
+
+**差异点（ELBO vs SDE baseline）**：
 
 ```python
 # ── train_elbo_grpo.py（主方法）──
 log_r = (ell_T - ell_eta).mean(dim=-1)   # ELBO ratio，teacher 做 old policy
 
-# ── train_sde_grpo.py（baseline）──
-# SDE 每步 log prob：log N(x_{t-1}; mu, sigma^2*|dt|*I)
-# 对探索样本 x1_exp 做反向 SDE（从 x1 到 x0），记录每步 log prob
-# log_r = log_p_student(trajectory) - log_p_teacher(trajectory)
+# ── train_sde_grpo.py（baseline, Flow-GRPO style）──
+# policy_old rollout: x1_exp, log_p_old, saved_noises = sde_sample_with_logprob(policy_old, ...)
+# policy new recompute: log_p_new = sde_logprob_recompute(student, z_exp, saved_noises, ...)
+# log_r = log_p_new - log_p_old
 ```
 
-SDE log prob 的计算参考 `sampler_sde.py`（见下）。
+SDE log prob 的计算与噪声复用参考 `sampler_sde.py`（见下）。
 
 ---
 
@@ -497,42 +503,26 @@ SDE log prob 的计算参考 `sampler_sde.py`（见下）。
 """
 SDE 采样 + log prob 计算，仅 SDE-GRPO baseline 使用。
 
-核心函数：sde_forward_with_logprob
-在给定 x1_exp 的情况下，计算 student/teacher 以 SDE 方式
-到达该终点的 log probability（用于 SDE IS ratio）。
+核心函数：
+  - `sde_sample_with_logprob`：Phase 1 rollout，返回 `(x1_exp, log_p_old, saved_noises)`
+  - `sde_logprob_recompute`：Phase 2 在同一 `saved_noises` 下重算 `log_p_new`
+
+关键点：Phase 2 必须复用 Phase 1 的噪声序列，否则 ratio 对应轨迹不一致。
 
 注意：在1步场景下，dt = -1.0，Gaussian 近似误差 = O(dt^2) = O(1)，
 这是 SDE-GRPO 在1步场景下的根本缺陷，也是我们对比实验的核心论点。
 """
 
-def sde_1step_logprob(model, z, x1, y, cfg_scale=1.5, sigma=0.1):
+def sde_sample_with_logprob(model, z, y, num_steps, cfg_scale=1.5, sigma=0.1):
     """
-    计算1步 SDE 到达 x1 的 log prob。
-    
-    SDE：x1 = z + v_theta(z, t=1) * (-1) + sigma * sqrt(1) * noise
-    
-    Gaussian 近似：
-        mu = z + v_theta(z, 1) * (-1.0)
-        std = sigma * sqrt(1.0)
-        log_p = log N(x1; mu, std^2 * I)
-               = -0.5 * ||x1 - mu||^2 / std^2 - 0.5 * D * log(2*pi*std^2)
-    
-    Args:
-        model:    SiT 模型
-        z:        初始噪声，shape (B, 4, 32, 32)
-        x1:       目标终点（x1_exp），shape (B, 4, 32, 32)
-        y:        class labels
-        sigma:    SDE 噪声强度，超参
-    
-    Returns:
-        log_prob: shape (B,)
-    
-    关键问题（写入注释，供论文讨论）：
-        dt = -1.0（从 t=1 到 t=0，1步）
-        Euler-Maruyama 局部截断误差 = O(dt^2) = O(1)
-        这意味着 Gaussian 近似在 dt=1 时是 O(1) 误差的，
-        log_prob 估计是 biased 的，不反映真实轨迹概率。
-        相比之下，ELBO ratio 无 dt 依赖（tau 是辅助变量，不是积分步长）。
+    用 Euler-Maruyama 从 z rollout 到 x1，并累积每步 log prob。
+    返回 x1、log_prob 以及每步噪声 saved_noises（可选）。
+    """
+    ...
+
+def sde_logprob_recompute(model, z, saved_noises, y, num_steps, cfg_scale=1.5, sigma=0.1):
+    """
+    在固定 saved_noises 下重算 log prob，用于 Phase 2 ratio。
     """
     ...
 ```

@@ -1,5 +1,6 @@
 import argparse
 import os
+from copy import deepcopy
 from time import time
 
 import torch
@@ -13,82 +14,26 @@ from download import find_model
 from grpo_utils import compute_grpo_advantage, ppo_clip_loss
 from models import SiT_models
 from reward_utils import ClassifierReward
-from sampler_sde import sde_1step_logprob
+from sampler_sde import sde_logprob_recompute, sde_sample_with_logprob
 from sit_sampler import student_ode_sample, teacher_ode_sample
 from train_utils import parse_transport_args
 from transport import create_transport
 
 
 def build_model(model_name, latent_size, num_classes, ckpt_path, device):
-    model = SiT_models[model_name](input_size=latent_size, num_classes=num_classes).to(device)
+    model = SiT_models[model_name](
+        input_size=latent_size,
+        num_classes=num_classes,
+        learn_sigma=True,
+    ).to(device)
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict, strict=True)
     return model
 
 
-def teacher_sample_chunked(teacher, transport, vae, y, num_steps, cfg_scale, latent_size, device, chunk_size, z=None, return_pixel=False):
-    if chunk_size <= 0 or y.shape[0] <= chunk_size:
-        return teacher_ode_sample(
-            teacher,
-            transport,
-            vae,
-            y,
-            num_steps=num_steps,
-            cfg_scale=cfg_scale,
-            latent_size=latent_size,
-            device=device,
-            z=z,
-            return_pixel=return_pixel,
-        )
-
-    latent_chunks = []
-    pixel_chunks = []
-    for start in range(0, y.shape[0], chunk_size):
-        end = min(start + chunk_size, y.shape[0])
-        z_chunk = None if z is None else z[start:end]
-        out = teacher_ode_sample(
-            teacher,
-            transport,
-            vae,
-            y[start:end],
-            num_steps=num_steps,
-            cfg_scale=cfg_scale,
-            latent_size=latent_size,
-            device=device,
-            z=z_chunk,
-            return_pixel=return_pixel,
-        )
-        if return_pixel:
-            lat, pix = out
-            latent_chunks.append(lat)
-            pixel_chunks.append(pix)
-        else:
-            latent_chunks.append(out)
-
-    latents = torch.cat(latent_chunks, dim=0)
-    if not return_pixel:
-        return latents
-    pixels = torch.cat(pixel_chunks, dim=0)
-    return latents, pixels
-
-
-def sde_logprob_chunked(model, z, x1, y, cfg_scale, sigma, chunk_size):
-    if chunk_size <= 0 or z.shape[0] <= chunk_size:
-        return sde_1step_logprob(model, z, x1, y, cfg_scale=cfg_scale, sigma=sigma)
-    out = []
-    for start in range(0, z.shape[0], chunk_size):
-        end = min(start + chunk_size, z.shape[0])
-        out.append(
-            sde_1step_logprob(
-                model,
-                z[start:end],
-                x1[start:end],
-                y[start:end],
-                cfg_scale=cfg_scale,
-                sigma=sigma,
-            )
-        )
-    return torch.cat(out, dim=0)
+def requires_grad(model, flag):
+    for p in model.parameters():
+        p.requires_grad = flag
 
 
 def main(args):
@@ -105,13 +50,17 @@ def main(args):
     teacher = build_model(args.model, latent_size, args.num_classes, args.ckpt, device)
     student = build_model(args.model, latent_size, args.num_classes, args.ckpt, device)
     teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
+    requires_grad(teacher, False)
+    policy_old = deepcopy(student).eval()
+    requires_grad(policy_old, False)
+    # Keep old policy on CPU by default to save VRAM; move to GPU only during rollout.
+    policy_old = policy_old.to("cpu")
+
+    rollout_steps = args.num_steps if args.num_steps is not None else args.T_exp
 
     transport = create_transport(args.path_type, args.prediction, args.loss_weight, args.train_eps, args.sample_eps)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device).eval()
-    for p in vae.parameters():
-        p.requires_grad = False
+    requires_grad(vae, False)
     reward_fn = ClassifierReward(device)
 
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.0, foreach=False)
@@ -139,31 +88,23 @@ def main(args):
         cond_g = base_y.repeat_interleave(g)
 
         with torch.no_grad():
+            policy_old = policy_old.to(device)
             z_exp = torch.randn(bg, 4, latent_size, latent_size, device=device)
-            x1_exp, x1_exp_pixel = teacher_sample_chunked(
-                teacher,
-                transport,
-                vae,
-                cond_g,
-                num_steps=args.T_exp,
-                cfg_scale=args.cfg_scale,
-                latent_size=latent_size,
-                device=device,
-                chunk_size=args.bg_chunk_size,
-                z=z_exp,
-                return_pixel=True,
-            )
-            rewards = reward_fn(x1_exp_pixel, cond_g).view(b, g)
-            advantage = compute_grpo_advantage(rewards, adv_clip=args.adv_clip).reshape(bg)
-            log_p_teacher = sde_logprob_chunked(
-                teacher,
+            x1_exp, log_p_old, saved_noises = sde_sample_with_logprob(
+                policy_old,
                 z_exp,
-                x1_exp,
                 cond_g,
+                num_steps=rollout_steps,
                 cfg_scale=args.cfg_scale,
                 sigma=args.sde_sigma,
                 chunk_size=args.bg_chunk_size,
+                return_noises=True,
             )
+            policy_old = policy_old.to("cpu")
+            torch.cuda.empty_cache()
+            x1_exp_pixel = vae.decode(x1_exp / 0.18215).sample
+            rewards = reward_fn(x1_exp_pixel, cond_g).view(b, g)
+            advantage = compute_grpo_advantage(rewards, adv_clip=args.adv_clip).reshape(bg)
 
             x1_hq = teacher_ode_sample(
                 teacher,
@@ -185,22 +126,24 @@ def main(args):
         last_l_grpo = torch.tensor(0.0, device=device)
         last_l_mse = torch.tensor(0.0, device=device)
 
-        for k in range(args.K):
+        for _ in range(args.K):
             with autocast("cuda", enabled=args.amp):
-                log_p_student = sde_logprob_chunked(
+                log_p_new = sde_logprob_recompute(
                     student,
                     z_exp.detach(),
-                    x1_exp.detach(),
+                    saved_noises,
                     cond_g,
+                    num_steps=rollout_steps,
                     cfg_scale=args.cfg_scale,
                     sigma=args.sde_sigma,
                     chunk_size=args.bg_chunk_size,
                 )
-                log_ratio = log_p_student - log_p_teacher
+                log_ratio = log_p_new - log_p_old
                 ratio = log_ratio.clamp(-5.0, 5.0).exp()
                 mean_ratio = ratio.mean().item()
                 if mean_ratio > args.ratio_stop or mean_ratio < 1.0 / args.ratio_stop:
                     break
+
                 l_grpo = ppo_clip_loss(ratio, advantage, eps_clip=args.eps_clip)
                 pred_hq = student(x_tau_hq.detach(), tau_hq, y=base_y)
                 l_mse = F.mse_loss(pred_hq, u_hq.detach())
@@ -218,6 +161,12 @@ def main(args):
             last_ratio = ratio.detach()
             last_l_grpo = l_grpo.detach()
             last_l_mse = l_mse.detach()
+
+        if step % args.old_policy_update_freq == 0:
+            policy_old.load_state_dict(student.state_dict(), strict=True)
+            policy_old.eval()
+            requires_grad(policy_old, False)
+            policy_old = policy_old.to("cpu")
 
         running["reward_mean"] += rewards.mean().item()
         running["reward_std"] += rewards.std().item()
@@ -241,7 +190,7 @@ def main(args):
                 f"it/s={args.log_every/dt:.2f}"
             )
             pbar.set_postfix(loss=f"{avg_loss:.4f}", ratio=f"{running['ratio']/c:.3f}", ips=f"{args.log_every/dt:.2f}")
-            running = {k: 0.0 for k in running}
+            running = {key: 0.0 for key in running}
             running["count"] = 0
             tic = time()
 
@@ -285,10 +234,12 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, default=256, choices=[256, 512])
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--T-exp", type=int, default=5)
+    parser.add_argument("--T-exp", type=int, default=5, help="Fallback SDE rollout steps when --num-steps is unset.")
+    parser.add_argument("--num-steps", type=int, default=None, help="SDE rollout steps for baseline policy.")
     parser.add_argument("--T-hq", type=int, default=50)
     parser.add_argument("--G", type=int, default=8)
     parser.add_argument("--K", type=int, default=4)
+    parser.add_argument("--old-policy-update-freq", type=int, default=100)
     parser.add_argument("--sde-sigma", type=float, default=0.1)
     parser.add_argument("--eps-clip", type=float, default=0.05)
     parser.add_argument("--adv-clip", type=float, default=2.0)

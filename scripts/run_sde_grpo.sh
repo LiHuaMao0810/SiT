@@ -6,11 +6,13 @@ DEVICE="${DEVICE:-cuda:3}"
 CKPT="${CKPT:-pretrained_models/SiT-XL-2-256x256.pt}"
 RESULTS_DIR="${RESULTS_DIR:-results/sde_grpo}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
-T_EXP="${T_EXP:-5}"
-T_HQ="${T_HQ:-50}"
+T_EXP="${T_EXP:-2}"
+NUM_STEPS="${NUM_STEPS:-1}"
+T_HQ="${T_HQ:-5}"
 G="${G:-4}"
 K="${K:-2}"
 BG_CHUNK_SIZE="${BG_CHUNK_SIZE:-2}"
+OLD_POLICY_UPDATE_FREQ="${OLD_POLICY_UPDATE_FREQ:-100}"
 SDE_SIGMA="${SDE_SIGMA:-0.1}"
 EPS_CLIP="${EPS_CLIP:-0.05}"
 ADV_CLIP="${ADV_CLIP:-2.0}"
@@ -19,9 +21,9 @@ RATIO_STOP="${RATIO_STOP:-1.5}"
 CFG_SCALE="${CFG_SCALE:-1.5}"
 LR="${LR:-1e-4}"
 TOTAL_ITERS="${TOTAL_ITERS:-3000}"
-LOG_EVERY="${LOG_EVERY:-50}"
-SAMPLE_EVERY="${SAMPLE_EVERY:-100}"   # 0 disables sample image saving
-CKPT_EVERY="${CKPT_EVERY:-1000}"       # 0 disables checkpoint saving
+LOG_EVERY="${LOG_EVERY:-10}"
+SAMPLE_EVERY="${SAMPLE_EVERY:-0}"      # 0 disables sample image saving
+CKPT_EVERY="${CKPT_EVERY:-0}"          # 0 disables checkpoint saving
 SEED="${SEED:-0}"
 
 python train_sde_grpo.py \
@@ -29,10 +31,12 @@ python train_sde_grpo.py \
   --results-dir "${RESULTS_DIR}" \
   --device "${DEVICE}" \
   --T-exp "${T_EXP}" \
+  --num-steps "${NUM_STEPS}" \
   --T-hq "${T_HQ}" \
   --batch-size "${BATCH_SIZE}" \
   --G "${G}" \
   --K "${K}" \
+  --old-policy-update-freq "${OLD_POLICY_UPDATE_FREQ}" \
   --bg-chunk-size "${BG_CHUNK_SIZE}" \
   --sde-sigma "${SDE_SIGMA}" \
   --eps-clip "${EPS_CLIP}" \

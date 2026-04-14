@@ -19,7 +19,11 @@ from transport import create_transport
 
 
 def build_model(model_name, latent_size, num_classes, ckpt_path, device):
-    model = SiT_models[model_name](input_size=latent_size, num_classes=num_classes).to(device)
+    model = SiT_models[model_name](
+        input_size=latent_size,
+        num_classes=num_classes,
+        learn_sigma=True,
+    ).to(device)
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict, strict=True)
     return model
@@ -194,11 +198,12 @@ def main(args):
                 log_ratio, ratio = compute_elbo_ratio(
                     student,
                     x1_exp,
-                    {**model_kwargs_g, "_chunk_size": args.bg_chunk_size},
+                    model_kwargs_g,
                     transport,
                     tau_mc,
                     eps_mc,
                     ell_t_cached,
+                    chunk_size=args.bg_chunk_size,
                 )
                 mean_ratio = ratio.mean().item()
                 if mean_ratio > args.ratio_stop or mean_ratio < 1.0 / args.ratio_stop:
@@ -244,7 +249,7 @@ def main(args):
                 f"it/s={args.log_every/dt:.2f}"
             )
             pbar.set_postfix(loss=f"{avg_loss:.4f}", ratio=f"{running['ratio']/c:.3f}", ips=f"{args.log_every/dt:.2f}")
-            running = {k: 0.0 for k in running}
+            running = {key: 0.0 for key in running}
             running["count"] = 0
             tic = time()
 

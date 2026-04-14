@@ -16,7 +16,11 @@ from transport import create_transport
 
 
 def build_model(model_name, latent_size, num_classes, ckpt_path, device):
-    model = SiT_models[model_name](input_size=latent_size, num_classes=num_classes).to(device)
+    model = SiT_models[model_name](
+        input_size=latent_size,
+        num_classes=num_classes,
+        learn_sigma=True,
+    ).to(device)
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict, strict=True)
     return model
